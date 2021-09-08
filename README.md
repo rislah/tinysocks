@@ -1,6 +1,4 @@
 # Tinysocks
-
-**TODO: Add description**
 wip
 ## Installation
 
