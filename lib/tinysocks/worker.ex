@@ -6,15 +6,15 @@ defmodule Tinysocks.Message do
   end
 end
 
-defmodule Tinysocks.Handler do
+defmodule Tinysocks.Worker do
   use GenServer
   require Logger
   alias Tinysocks.Message
 
   @supported_version 5
   @no_auth 0
-  @user_pass 2
   @behaviour :ranch_protocol
+  @user_pass 2
 
   @spec start_link(any, any, any) :: {:ok, pid}
   def start_link(ref, transport, opts) do
@@ -33,12 +33,13 @@ defmodule Tinysocks.Handler do
     :gen_server.enter_loop(__MODULE__, [], %{
       socket: socket,
       transport: transport,
-      auth_method: 0,
       opts: []
     })
   end
 
   def handle_info({:tcp, _, payload}, %{socket: socket, transport: transport, opts: opts} = state) do
+    IO.inspect(payload)
+
     case parse_packet(payload, opts) do
       {:error, reason} ->
         Logger.error(fn ->
@@ -48,15 +49,9 @@ defmodule Tinysocks.Handler do
         transport.close(socket)
         {:noreply, state}
 
-      %Message{stage: stage, bin: bin, opts: opts} ->
+      %Message{bin: bin, opts: opts} ->
         transport.send(socket, bin)
         transport.setopts(socket, active: :once)
-
-        case stage do
-          "greeting" -> {:noreply, %{state | opts: opts, auth_method: :binary.at(bin, 1)}}
-          _ -> {:noreply, %{state | opts: opts}}
-        end
-
         {:noreply, %{state | opts: opts}}
     end
   end
@@ -77,6 +72,18 @@ defmodule Tinysocks.Handler do
     {:stop, :normal, state}
   end
 
+  def parse_packet(
+        <<version, username_len, username::binary-size(username_len), password_len,
+          password::binary-size(password_len)>>,
+        _
+      ) do
+    if username == "kasutaja" and password == "parool" do
+      Message.new(Atom.to_string(:auth), <<version, 0>>)
+    else
+      Message.new(Atom.to_string(:auth), <<version, 1>>)
+    end
+  end
+
   def parse_packet(<<_version, num_methods, methods::binary-size(num_methods)>>, _) do
     methods_list = :binary.bin_to_list(methods)
     method = choose_method(methods_list)
@@ -89,12 +96,13 @@ defmodule Tinysocks.Handler do
     :ranch_tcp.send(sock, x)
     {:ok, packet} = :ranch_tcp.recv(sock, 0, 1000)
     :ranch_tcp.close(sock)
-    Message.new(Atom.to_string(:request), packet, [])
+    IO.inspect(packet)
+    Message.new(Atom.to_string(:request), packet , [])
   end
 
+
   def parse_packet(
-        <<_version, _command, _rsv, 3, host_len, host::binary-size(host_len), port_significant,
-          port>>,
+        <<_version, _command, _rsv, 3, host_len, host::binary-size(host_len), port_significant, port>>,
         opts
       )
       when length(opts) == 0 do
@@ -140,4 +148,19 @@ defmodule Tinysocks.Handler do
   defp choose_method(_head, tail) do
     choose_method(tail)
   end
+
+  # defp read_loop(sock) do
+  #   read_loop(sock, <<>>, 0)
+  # end
+
+
+  # defp read_loop(_sock, data, read) when read == 0 do
+  #   data
+  # end
+
+  # defp read_loop(sock, data, _read) do
+  #   {:ok, packet} = :ranch_tcp.recv(sock, 0, 1000)
+  #   IO.inspect(packet)
+  #   read_loop(sock, data <> packet, length(packet))
+  # end
 end
