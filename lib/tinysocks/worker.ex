@@ -1,22 +1,12 @@
-defmodule Tinysocks.Message do
-  defstruct stage: "", bin: <<>>, opts: []
-
-  def new(stage, bin, opts \\ []) do
-    %__MODULE__{stage: stage, bin: bin, opts: opts}
-  end
-end
-
 defmodule Tinysocks.Worker do
   use GenServer
   require Logger
-  alias Tinysocks.Message
 
-  @supported_version 5
-  @no_auth 0
   @behaviour :ranch_protocol
+  @no_auth 0
+  @supported_version 5
   @user_pass 2
 
-  @spec start_link(any, any, any) :: {:ok, pid}
   def start_link(ref, transport, opts) do
     pid = :proc_lib.spawn_link(__MODULE__, :init, [ref, transport, opts])
     {:ok, pid}
@@ -33,27 +23,57 @@ defmodule Tinysocks.Worker do
     :gen_server.enter_loop(__MODULE__, [], %{
       socket: socket,
       transport: transport,
-      opts: []
+      sock_status: "",
+      request_ip: 0,
+      request_port: 0
     })
   end
 
-  def handle_info({:tcp, _, payload}, %{socket: socket, transport: transport, opts: opts} = state) do
-    IO.inspect(payload)
+  def handle_info({:tcp, _, payload}, state) do
+    reply =
+      case check_packet_type(payload) do
+        {:greeting, [_num_methods | methods]} ->
+          method = choose_method(:binary.bin_to_list(List.first(methods)))
+          state.transport.setopts(state.socket, active: :once)
+          state.transport.send(state.socket, <<5, method>>)
+          {:noreply, %{state | sock_status: "greeting"}}
 
-    case parse_packet(payload, opts) do
-      {:error, reason} ->
-        Logger.error(fn ->
-          "Parse packet error: #{inspect(reason)}"
-        end)
+        {:auth, [username | password]} ->
+          bin =
+            if username == "kasutaja" and List.first(password) == "parool" do
+              <<5, 0>>
+            else
+              <<5, 1>>
+            end
 
-        transport.close(socket)
-        {:noreply, state}
+          state.transport.setopts(state.socket, active: :once)
+          state.transport.send(state.socket, bin)
+          {:noreply, %{state | sock_status: "auth"}}
 
-      %Message{bin: bin, opts: opts} ->
-        transport.send(socket, bin)
-        transport.setopts(socket, active: :once)
-        {:noreply, %{state | opts: opts}}
-    end
+        {:request, [ip | port]} ->
+          ip_bin = :binary.list_to_bin(Tuple.to_list(ip))
+          port = List.first(port)
+
+          bin = <<5, 0, 0, 1>> <> ip_bin <> port_to_bin(port)
+          state.transport.send(state.socket, bin)
+          state.transport.setopts(state.socket, active: false)
+
+          case :gen_tcp.connect(ip, port, active: false) do
+            {:ok, target} ->
+              forwarding(target, state.socket)
+
+            {:error, reason} ->
+              IO.inspect(reason)
+          end
+
+          {:noreply, %{state | sock_status: "proxying"}}
+
+        _ ->
+          :ranch_tcp.close(state.socket)
+          {:stop, :shutdown, state}
+      end
+
+    reply
   end
 
   def handle_info({:tcp_closed, _}, state) do
@@ -72,61 +92,59 @@ defmodule Tinysocks.Worker do
     {:stop, :normal, state}
   end
 
-  def parse_packet(
-        <<version, username_len, username::binary-size(username_len), password_len,
-          password::binary-size(password_len)>>,
-        _
-      ) do
-    if username == "kasutaja" and password == "parool" do
-      Message.new(Atom.to_string(:auth), <<version, 0>>)
-    else
-      Message.new(Atom.to_string(:auth), <<version, 1>>)
+  def port_to_bin(port) do
+    case :binary.encode_unsigned(port) do
+      <<significant, port>> ->
+        <<significant, port>>
+
+      <<port>> ->
+        <<0, port>>
     end
   end
 
-  def parse_packet(<<_version, num_methods, methods::binary-size(num_methods)>>, _) do
-    methods_list = :binary.bin_to_list(methods)
-    method = choose_method(methods_list)
-    Message.new(Atom.to_string(:greeting), <<@supported_version, method>>)
-  end
-
-  def parse_packet(<<x::binary>>, opts) when length(opts) > 0 do
-    [ip, port] = opts
-    {:ok, sock} = :ranch_tcp.connect(List.to_tuple(ip), port, active: false)
-    :ranch_tcp.send(sock, x)
-    {:ok, packet} = :ranch_tcp.recv(sock, 0, 1000)
-    :ranch_tcp.close(sock)
-    IO.inspect(packet)
-    Message.new(Atom.to_string(:request), packet , [])
-  end
-
-
-  def parse_packet(
-        <<_version, _command, _rsv, 3, host_len, host::binary-size(host_len), port_significant, port>>,
-        opts
-      )
-      when length(opts) == 0 do
+  def check_packet_type(<<_version, _command, _rsv, 3, host_len, host::binary-size(host_len), port_significant, port>>) do
     case :inet.getaddr(to_charlist(host), :inet) do
       {:ok, ip} ->
-        Message.new(
-          Atom.to_string(:request),
-          <<@supported_version, 0, 0, 1>> <>
-            :binary.list_to_bin(Tuple.to_list(ip)) <> <<port_significant, port>>,
-          [Tuple.to_list(ip), :binary.decode_unsigned(<<port_significant, port>>)]
-        )
+        {:request, [ip, :binary.decode_unsigned(<<port_significant, port>>)]}
 
       {:error, reason} ->
-        {:error, reason}
+        IO.inspect(reason)
+        {:request, []}
     end
   end
 
-  def parse_packet(<<5, _command, _rsv, 1, ip::binary-size(4), port_significant, port>>, opts)
-      when length(opts) == 0 do
-    Message.new(
-      Atom.to_string(:request),
-      <<5, 0, 0, 1>> <> ip <> <<port_significant, port>>,
-      [:binary.bin_to_list(ip), :binary.decode_unsigned(<<port_significant, port>>)]
-    )
+  def check_packet_type(<<_version, _command, _rsv, 1, ip::binary-size(4), port_significant, port>>) do
+    {:request, [List.to_tuple(:binary.bin_to_list(ip)), :binary.decode_unsigned(<<port_significant, port>>)]}
+  end
+
+  def check_packet_type(
+        <<_version, username_len, username::binary-size(username_len), password_len,
+          password::binary-size(password_len)>>
+      ) do
+    {:auth, [username, password]}
+  end
+
+  def check_packet_type(<<_version, num_methods, methods::binary-size(num_methods)>>) do
+    {:greeting, [num_methods, methods]}
+  end
+
+  defp forwarding(target, client) do
+    {:ok, afterward_pid} = Task.start(fn -> forward(client, target) end)
+    :gen_tcp.controlling_process(client, afterward_pid)
+
+    {:ok, backward_pid} = Task.start(fn -> forward(target, client) end)
+    :gen_tcp.controlling_process(target, backward_pid)
+  end
+
+  defp forward(from, to) do
+    with {:ok, data} <- :gen_tcp.recv(from, 0),
+         :ok <- :gen_tcp.send(to, data) do
+      forward(from, to)
+    else
+      _ ->
+        :gen_tcp.close(from)
+        :gen_tcp.close(to)
+    end
   end
 
   defp choose_method([]) do
@@ -148,19 +166,4 @@ defmodule Tinysocks.Worker do
   defp choose_method(_head, tail) do
     choose_method(tail)
   end
-
-  # defp read_loop(sock) do
-  #   read_loop(sock, <<>>, 0)
-  # end
-
-
-  # defp read_loop(_sock, data, read) when read == 0 do
-  #   data
-  # end
-
-  # defp read_loop(sock, data, _read) do
-  #   {:ok, packet} = :ranch_tcp.recv(sock, 0, 1000)
-  #   IO.inspect(packet)
-  #   read_loop(sock, data <> packet, length(packet))
-  # end
 end
