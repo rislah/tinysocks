@@ -6,6 +6,8 @@ defmodule Tinysocks.Worker do
   @no_auth 0
   @supported_version 5
   @user_pass 2
+  @auth Application.get_env(:tinysocks, :auth)
+  @accepted_creds Application.get_env(:tinysocks, :accepted_credentials)
 
   def start_link(ref, transport, opts) do
     pid = :proc_lib.spawn_link(__MODULE__, :init, [ref, transport, opts])
@@ -23,7 +25,7 @@ defmodule Tinysocks.Worker do
     :gen_server.enter_loop(__MODULE__, [], %{
       socket: socket,
       transport: transport,
-      sock_status: "",
+      status: "",
       request_ip: 0,
       request_port: 0
     })
@@ -34,9 +36,16 @@ defmodule Tinysocks.Worker do
       case check_packet_type(payload) do
         {:greeting, [_num_methods | methods]} ->
           method = choose_method(:binary.bin_to_list(List.first(methods)))
+          Logger.debug(":greeting | auth: #{inspect(@auth)}, method: #{inspect(method)}")
+
+          if @auth and method != @user_pass do
+            state.transport.send(state.socket, <<5, 0xFF>>)
+          else
+            state.transport.send(state.socket, <<5, method>>)
+          end
+
           state.transport.setopts(state.socket, active: :once)
-          state.transport.send(state.socket, <<5, method>>)
-          {:noreply, %{state | sock_status: "greeting"}}
+          {:noreply, %{state | status: "greeting"}}
 
         {:auth, [username | password]} ->
           bin =
@@ -48,7 +57,7 @@ defmodule Tinysocks.Worker do
 
           state.transport.setopts(state.socket, active: :once)
           state.transport.send(state.socket, bin)
-          {:noreply, %{state | sock_status: "auth"}}
+          {:noreply, %{state | status: "auth"}}
 
         {:request, [ip | port]} ->
           ip_bin = :binary.list_to_bin(Tuple.to_list(ip))
@@ -66,9 +75,14 @@ defmodule Tinysocks.Worker do
               IO.inspect(reason)
           end
 
-          {:noreply, %{state | sock_status: "proxying"}}
+          {:noreply, %{state | status: "proxying"}}
 
-        _ ->
+        {:error, reason} ->
+          case reason do
+            :nxdomain ->
+              state.transport.send(state.socket, <<5, 4, 0::size(64)>>)
+          end
+
           :ranch_tcp.close(state.socket)
           {:stop, :shutdown, state}
       end
@@ -108,8 +122,7 @@ defmodule Tinysocks.Worker do
         {:request, [ip, :binary.decode_unsigned(<<port_significant, port>>)]}
 
       {:error, reason} ->
-        IO.inspect(reason)
-        {:request, []}
+        {:error, reason}
     end
   end
 
@@ -129,10 +142,10 @@ defmodule Tinysocks.Worker do
   end
 
   defp forwarding(target, client) do
-    {:ok, afterward_pid} = Task.start(fn -> forward(client, target) end)
+    {:ok, afterward_pid} = Task.Supervisor.start_child(Tinysocks.TaskSupervisor, fn -> forward(client, target) end)
     :gen_tcp.controlling_process(client, afterward_pid)
 
-    {:ok, backward_pid} = Task.start(fn -> forward(target, client) end)
+    {:ok, backward_pid} = Task.Supervisor.start_child(Tinysocks.TaskSupervisor, fn -> forward(target, client) end)
     :gen_tcp.controlling_process(target, backward_pid)
   end
 
@@ -155,12 +168,14 @@ defmodule Tinysocks.Worker do
     choose_method(head, tail)
   end
 
-  defp choose_method(@no_auth, _tail) do
-    @no_auth
+  defp choose_method(@user_pass, _tail) when @auth do
+
+    @user_pass
   end
 
-  defp choose_method(@user_pass, _tail) do
-    @user_pass
+
+  defp choose_method(@no_auth, _tail) when not @auth do
+    @no_auth
   end
 
   defp choose_method(_head, tail) do

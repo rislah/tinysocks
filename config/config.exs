@@ -1,5 +1,6 @@
 import Config
 
 config :tinysocks,
-  host: "127.0.0.1",
-  port: 1088
+  port: 1080,
+  auth: true,
+  accepted_credentials: %{username: "kasutaja", parool: "parool"}
